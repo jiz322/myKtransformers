@@ -1,15 +1,15 @@
 #!/usr/bin/env python
-# qwen3_manual.py
+# qwen3_manual_fixed.py
 #
 # Pure‑PyTorch inference for Qwen3‑30B‑A3B (Mixture‑of‑Experts)
+# Fixes: head_dim alignment, correct projection sizes, rope embedding, and misc bugs.
 # Requirements: torch>=2.1, safetensors>=0.5.3, tokenizers>=0.21
 # Usage:
-#   python qwen3_manual.py \
+#   python qwen3_manual_fixed.py \ 
 #       --model-dir ../LLMs/Qwen3-30B-A3B \
 #       --prompt "Give me a short introduction to large language model." \
 #       --device cuda:0 --dtype bfloat16 --max-new 200 --temperature 0.8
-#
-# ---------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 import argparse, json, math, os, time, gc
 import torch
@@ -17,20 +17,18 @@ torch.set_grad_enabled(False)
 from safetensors.torch import load_file
 from tokenizers import Tokenizer
 
-# -------------------------------- qwen3_manual.py (add at top) ---
-TARGET_DTYPE = torch.bfloat16      # will be overwritten by CLI
+# ---------------------------------------------------------------
+TARGET_DTYPE = torch.bfloat16      # overwritten by CLI
 
-def LIN(in_f, out_f, bias=False):        # 1 line helper
+def LIN(in_f, out_f, bias=False):
     return torch.nn.Linear(in_f, out_f, bias=bias,
                            device="cpu", dtype=TARGET_DTYPE)
 
 def EMB(vocab, dim):
     return torch.nn.Embedding(vocab, dim, device="cpu", dtype=TARGET_DTYPE)
-# -----------------------------------------------------------------
-
-
 
 # ------------------ tiny utilities ------------------------------------------------
+
 def get_rope(freqs, t, x):
     sin, cos = freqs
     x1 = x[..., 0::2]
@@ -47,16 +45,16 @@ class RMSNorm(torch.nn.Module):
     def forward(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
-# Rotary embedding (rope_theta comes from config) ----------------
+# Rotary embedding --------------------------------------------------------------
 class RotaryEmbedding:
     def __init__(self, dim, max_pos, theta=1e6, device="cpu", dtype=torch.float32):
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, device=device, dtype=dtype) / dim))
         t = torch.arange(max_pos, device=device, dtype=dtype)
         freqs = torch.outer(t, inv_freq)          # [max_pos, dim/2]
-        self.sin = freqs.sin()                    # buffers, not parameters
+        self.sin = freqs.sin()
         self.cos = freqs.cos()
 
-# Expert MLP ------------------------------------------------------
+# Expert MLP ---------------------------------------------------------------------
 class ExpertMLP(torch.nn.Module):
     def __init__(self, in_dim, hidden_dim):
         super().__init__()
@@ -68,49 +66,50 @@ class ExpertMLP(torch.nn.Module):
     def forward(self, x):
         return self.down_proj(self.act(self.up_proj(x)))
 
-# Sparse‑MoE block ------------------------------------------------
+# Sparse‑MoE block ---------------------------------------------------------------
 class SparseMoe(torch.nn.Module):
     def __init__(self, in_dim, hidden_dim, num_experts=128, top_k=8):
         super().__init__()
         self.top_k = top_k
         self.gate = LIN(in_dim, num_experts, bias=False)
-        self.experts = torch.nn.ModuleList([ExpertMLP(in_dim, hidden_dim) 
+        self.experts = torch.nn.ModuleList([ExpertMLP(in_dim, hidden_dim)
                                             for _ in range(num_experts)])
 
     def forward(self, x):
-        # x: [B, T, D]
         gate_logits = self.gate(x)                        # [B, T, E]
-        topk_scores, topk_idx = torch.topk(gate_logits, self.top_k, dim=-1)  # …,k
-        gate_weights = torch.softmax(topk_scores, dim=-1)                    # probs
+        topk_scores, topk_idx = torch.topk(gate_logits, self.top_k, dim=-1)
+        gate_weights = torch.softmax(topk_scores, dim=-1)
         out = torch.zeros_like(x)
         for i in range(self.top_k):
-            idx = topk_idx[..., i]                       # [B, T]
-            weight = gate_weights[..., i].unsqueeze(-1)  # [B,T,1]
+            idx = topk_idx[..., i]
+            weight = gate_weights[..., i].unsqueeze(-1)
             y = torch.stack([self.experts[e](tok) for e, tok in
-                             zip(idx.view(-1), x.view(-1, x.size(-1)))])      # slow CPU
+                             zip(idx.view(-1), x.view(-1, x.size(-1)))])
             y = y.view_as(x)
             out += weight * y
         return out
 
-# Attention -------------------------------------------------------
+# Attention ----------------------------------------------------------------------
 class QwenAttention(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.n_heads = cfg["num_attention_heads"]
-        self.n_kv = cfg["num_key_value_heads"]
-        self.head_dim = cfg["hidden_size"] // self.n_heads
-        self.q_proj = LIN(cfg["hidden_size"], cfg["hidden_size"]*2, bias=False)
-        self.k_proj = LIN(cfg["hidden_size"], self.n_kv*self.head_dim, bias=False)
-        self.v_proj = LIN(cfg["hidden_size"], self.n_kv*self.head_dim, bias=False)
-        self.o_proj = LIN(cfg["hidden_size"]*2, cfg["hidden_size"], bias=False)
-        self.q_norm = RMSNorm(self.head_dim*2, eps=cfg["rms_norm_eps"])
+        self.n_kv    = cfg["num_key_value_heads"]
+        self.head_dim = cfg["head_dim"]            # fixed 128
+
+        self.q_proj = LIN(cfg["hidden_size"], self.n_heads * self.head_dim, bias=False)
+        self.k_proj = LIN(cfg["hidden_size"], self.n_kv   * self.head_dim, bias=False)
+        self.v_proj = LIN(cfg["hidden_size"], self.n_kv   * self.head_dim, bias=False)
+        self.o_proj = LIN(self.n_heads * self.head_dim, cfg["hidden_size"], bias=False)
+
+        self.q_norm = RMSNorm(self.head_dim, eps=cfg["rms_norm_eps"])
         self.k_norm = RMSNorm(self.head_dim, eps=cfg["rms_norm_eps"])
 
     def forward(self, x, rope: RotaryEmbedding):
         B, T, _ = x.shape
-        q = self.q_proj(x).view(B, T, self.n_heads, 2*self.head_dim)
-        k = self.k_proj(x).view(B, T, self.n_kv, self.head_dim)
-        v = self.v_proj(x).view(B, T, self.n_kv, self.head_dim)
+        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim)
+        k = self.k_proj(x).view(B, T, self.n_kv,   self.head_dim)
+        v = self.v_proj(x).view(B, T, self.n_kv,   self.head_dim)
 
         pos = torch.arange(T, device=x.device)
         q = self.q_norm(q)
@@ -121,18 +120,23 @@ class QwenAttention(torch.nn.Module):
 
         att = (q @ k.transpose(-1, -2)) / math.sqrt(self.head_dim)
         att = att.softmax(-1)
-        out = att @ v                                 # [B,T,H,hd]
+        out = att @ v                                # [B,T,H,hd]
         out = out.view(B, T, -1)
         return self.o_proj(out)
 
-# Decoder layer ---------------------------------------------------
+# Decoder layer ------------------------------------------------------------------
 class DecoderLayer(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
         h = cfg["hidden_size"]
         self.self_attn = QwenAttention(cfg)
-        self.mlp  = SparseMoe(h, h//2, cfg["num_experts"], cfg["num_experts_per_tok"])
-        self.input_layernorm        = RMSNorm(h, eps=cfg["rms_norm_eps"])
+        self.mlp  = SparseMoe(
+            in_dim=h,
+            hidden_dim=cfg["moe_intermediate_size"],
+            num_experts=cfg["num_experts"],
+            top_k=cfg["num_experts_per_tok"],
+        )
+        self.input_layernorm          = RMSNorm(h, eps=cfg["rms_norm_eps"])
         self.post_attention_layernorm = RMSNorm(h, eps=cfg["rms_norm_eps"])
 
     def forward(self, x, rope):
@@ -140,40 +144,42 @@ class DecoderLayer(torch.nn.Module):
         h = h + self.mlp(self.post_attention_layernorm(h))
         return h
 
-
-# --- small wrapper so every key starts with  “model.” -----------------
-class QwenMoe(torch.nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        self.model = _QwenBody(cfg)           # everything except head
-        self.lm_head = LIN(cfg["hidden_size"], cfg["vocab_size"], bias=False)
-
-    def forward(self, input_ids):
-        hidden = self.model(input_ids)
-        return self.lm_head(hidden)
-# Complete model --------------------------------------------------
+# Model wrappers ------------------------------------------------------------------
 class _QwenBody(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.embed_tokens = EMB(cfg["vocab_size"], cfg["hidden_size"])
+        self.rope = RotaryEmbedding(
+            dim=cfg["head_dim"],
+            max_pos=cfg["max_position_embeddings"],
+            theta=cfg["rope_theta"],
+            device="cpu", dtype=TARGET_DTYPE)
         self.layers = torch.nn.ModuleList([DecoderLayer(cfg)
-                                        for _ in range(cfg["num_hidden_layers"])])
+                                           for _ in range(cfg["num_hidden_layers"])])
         self.norm = RMSNorm(cfg["hidden_size"], eps=cfg["rms_norm_eps"])
-        self.lm_head = LIN(cfg["hidden_size"], cfg["vocab_size"], bias=False)
 
     def forward(self, input_ids):
         h = self.embed_tokens(input_ids)
         for layer in self.layers:
             h = layer(h, self.rope)
-        return self.norm(h)              # <-- end here
+        return self.norm(h)
 
-# ------------------ weight loader --------------------------------
+class QwenMoe(torch.nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.model = _QwenBody(cfg)
+        self.lm_head = LIN(cfg["hidden_size"], cfg["vocab_size"], bias=False)
+
+    def forward(self, input_ids):
+        hidden = self.model(input_ids)
+        return self.lm_head(hidden)
+
+# ------------------ weight loader ---------------------------------------------
 
 def load_weights(model, model_dir, dtype=torch.bfloat16, device="cpu"):
     idx_path = os.path.join(model_dir, "model.safetensors.index.json")
     weight_map = json.load(open(idx_path))["weight_map"]
 
-    # group tensor‑names per shard to avoid reopening the index repeatedly
     shard_to_names = {}
     for name, shard in weight_map.items():
         shard_to_names.setdefault(shard, []).append(name)
@@ -184,41 +190,36 @@ def load_weights(model, model_dir, dtype=torch.bfloat16, device="cpu"):
         print(f"#{i} shard start loading")
         shard_path = os.path.join(model_dir, shard)
         print("start load_file")
-        tensor_map = load_file(shard_path, device="cpu")     # 1⃣ load once on CPU
-        for i, name in enumerate(names):
+        tensor_map = load_file(shard_path, device="cpu")
+        for j, name in enumerate(names):
             tensor = tensor_map[name]
             if tensor.dtype != dtype:
-                print(f"start the {i} to dtype")
-                tensor = tensor.to(dtype)                    # 2⃣ convert in‑place
-            param_dict[name].data.copy_(tensor)              # 3⃣ copy directly
-            del tensor_map[name]                             # free asap
-        del tensor_map                                       # free shard
-        gc.collect()                                         # hint to Python
-        torch.cuda.empty_cache()                             # in case device is CUDA
-
+                tensor = tensor.to(dtype)
+            if param_dict[name].shape != tensor.shape:
+                raise RuntimeError(f"Shape mismatch for {name}: param {param_dict[name].shape} vs tensor {tensor.shape}")
+            param_dict[name].data.copy_(tensor)
+            del tensor_map[name]
+        del tensor_map
+        gc.collect()
+        torch.cuda.empty_cache()
     return model
 
-def group_by_shard(weight_map):
-    by = {}
-    for name, shard in weight_map.items():
-        by.setdefault(shard, []).append(name)
-    return by
-
-# ------------------ generation loop ------------------------------
+# ------------------ generation loop -------------------------------------------
 @torch.no_grad()
 def generate(model, input_ids, max_new=128, temperature=0.8, top_p=0.95, top_k=50, eos=None):
     model.eval()
     for _ in range(max_new):
-        logits = model(input_ids)[:, -1, :] / temperature   # [B,V]
+        logits = model(input_ids)[:, -1, :] / temperature
         topk_vals, topk_idx = torch.topk(logits, top_k, dim=-1)
         probs = torch.softmax(topk_vals, -1)
         next_token = topk_idx.gather(-1, torch.multinomial(probs, 1))
         input_ids = torch.cat([input_ids, next_token], dim=-1)
-        if eos and next_token.item() == eos:
+        if eos is not None and next_token.item() == eos:
             break
     return input_ids
 
-# ------------------ main -----------------------------------------
+# ------------------ main -------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-dir", required=True)
@@ -233,12 +234,14 @@ def main():
     tok = Tokenizer.from_file(os.path.join(args.model_dir, "tokenizer.json"))
 
     device = torch.device(args.device)
-    dtype = getattr(torch, args.dtype)
+    global TARGET_DTYPE
+    TARGET_DTYPE = getattr(torch, args.dtype)
 
     print("Building model …")
     model = QwenMoe(cfg).to(args.device)
+    
     print("Loading weights … (this takes a few minutes the first time)")
-    load_weights(model, args.model_dir, dtype=dtype, device=device)
+    load_weights(model, args.model_dir, dtype=TARGET_DTYPE, device=device)
 
     input_ids = torch.tensor([tok.encode(args.prompt).ids], device=device)
     start = time.time()
