@@ -130,35 +130,42 @@ class DecoderLayer(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
         h = cfg["hidden_size"]
-        self.attn = QwenAttention(cfg)
+        self.self_attn = QwenAttention(cfg)
         self.mlp  = SparseMoe(h, h//2, cfg["num_experts"], cfg["num_experts_per_tok"])
-        self.inp_norm  = RMSNorm(h, eps=cfg["rms_norm_eps"])
-        self.post_norm = RMSNorm(h, eps=cfg["rms_norm_eps"])
+        self.input_layernorm        = RMSNorm(h, eps=cfg["rms_norm_eps"])
+        self.post_attention_layernorm = RMSNorm(h, eps=cfg["rms_norm_eps"])
 
     def forward(self, x, rope):
-        h = x + self.attn(self.inp_norm(x), rope)
-        h = h + self.mlp(self.post_norm(h))
+        h = x + self.self_attn(self.input_layernorm(x), rope)
+        h = h + self.mlp(self.post_attention_layernorm(h))
         return h
 
-# Complete model --------------------------------------------------
+
+# --- small wrapper so every key starts with  “model.” -----------------
 class QwenMoe(torch.nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.emb = EMB(cfg["vocab_size"], cfg["hidden_size"])
-        self.layers = torch.nn.ModuleList([DecoderLayer(cfg) for _ in range(cfg["num_hidden_layers"])])
-        self.norm = RMSNorm(cfg["hidden_size"], eps=cfg["rms_norm_eps"])
+        self.model = _QwenBody(cfg)           # everything except head
         self.lm_head = LIN(cfg["hidden_size"], cfg["vocab_size"], bias=False)
-        self.rope = RotaryEmbedding(cfg["hidden_size"]//cfg["num_attention_heads"],
-                                    max_pos=40960,            # from model card
-                                    theta=cfg["rope_theta"])
 
     def forward(self, input_ids):
-        device = input_ids.device
-        h = self.emb(input_ids)
+        hidden = self.model(input_ids)
+        return self.lm_head(hidden)
+# Complete model --------------------------------------------------
+class _QwenBody(torch.nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.embed_tokens = EMB(cfg["vocab_size"], cfg["hidden_size"])
+        self.layers = torch.nn.ModuleList([DecoderLayer(cfg)
+                                        for _ in range(cfg["num_hidden_layers"])])
+        self.norm = RMSNorm(cfg["hidden_size"], eps=cfg["rms_norm_eps"])
+        self.lm_head = LIN(cfg["hidden_size"], cfg["vocab_size"], bias=False)
+
+    def forward(self, input_ids):
+        h = self.embed_tokens(input_ids)
         for layer in self.layers:
             h = layer(h, self.rope)
-        h = self.norm(h)
-        return self.lm_head(h)
+        return self.norm(h)              # <-- end here
 
 # ------------------ weight loader --------------------------------
 
