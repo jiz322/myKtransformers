@@ -38,12 +38,21 @@ def EMB(vocab, dim):
 
 # ‑‑‑‑‑ tiny helpers ‑‑‑‑‑----------------------------------------------------
 
-def get_rope(freqs, t, x):
+# ---------------------------------------------------------------------------
+# Correct RoPE broadcast:  sin,cos -> [1, T, 1, Hd/2]
+def get_rope(freqs, positions, x):
+    """
+    x:  [B, T, H, Hd]   (even Hd)
+    freqs: (sin, cos) where each is [max_pos, Hd/2]
+    positions: LongTensor [T]  (0,1,2,...T‑1)
+    """
     sin, cos = freqs
-    x1 = x[..., 0::2]
-    x2 = x[..., 1::2]
-    sin, cos = sin[t].unsqueeze(0), cos[t].unsqueeze(0)
-    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+    sin = sin[positions].unsqueeze(0).unsqueeze(2).to(x.dtype)   # [1,T,1,Hd/2]
+    cos = cos[positions].unsqueeze(0).unsqueeze(2).to(x.dtype)
+
+    x1, x2 = x[..., 0::2], x[..., 1::2]                          # split last dim
+    return torch.cat([x1 * cos - x2 * sin,                      # rotate pairs
+                      x1 * sin + x2 * cos], dim=-1)
 
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim, eps=1e-6):
@@ -96,7 +105,8 @@ class SparseMoe(torch.nn.Module):
             flat_x = x.view(-1, x.size(-1))
             expert_out = torch.stack([self.experts[e](tok)
                                       for e, tok in zip(idx.view(-1), flat_x)], dim=0)
-            out += weight.view_as(x) * expert_out.view_as(x)
+            out += weight * expert_out.view_as(x)   # (B,T,1) * (B,T,D)  ->  broadcast OK
+
         return out
 
 # Attention -----------------------------------------------------------------
@@ -128,11 +138,9 @@ class QwenAttention(torch.nn.Module):
         q = get_rope((rope.sin, rope.cos), pos, q)
         k = get_rope((rope.sin, rope.cos), pos, k)
 
-        # ---- dtype‑safe scaled‑dot‑product ------------------------------
         att = (q.float() @ k.float().transpose(-1, -2)) / math.sqrt(self.head_dim)
-        att = att.softmax(-1).to(q.dtype)
-
-        out = (att @ v.float()).to(q.dtype)        # [B,T,H,hd]
+        att = att.softmax(-1)                  # stay in FP32
+        out = (att @ v.float()).to(q.dtype)    # cast only the result
         return self.o_proj(out.view(B, T, -1))
 
 # Decoder layer --------------------------------------------------------------
