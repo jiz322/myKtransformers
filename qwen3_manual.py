@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# qwen3_manual_amx.py  ―  Pure‑PyTorch (+IPEX) inference for Qwen3‑30B‑A3B
+# qwen3_manual.py  ―  Pure‑PyTorch (+IPEX) inference for Qwen3‑30B‑A3B
 #
 #   • Works on Sapphire‑Rapids/W‑re‑badged Xeon with AMX (BF16 / INT8 tiles)
 #   • No CUDA dependency – everything runs on the CPU
@@ -11,7 +11,7 @@
 #
 # Example:
 #   DNNL_MAX_CPU_ISA=AMX ONEDNN_VERBOSE=1 \
-#   python qwen3_manual_amx.py \
+#   python qwen3_manual.py \
 #       --model-dir ~/LLMs/Qwen3-30B-A3B \
 #       --prompt "Give me a short introduction to large language model." \
 #       --dtype bfloat16 --max-new 64 --temperature 0.8
@@ -125,23 +125,58 @@ class QwenAttention(torch.nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=cfg['rms_norm_eps'])
         self.k_norm = RMSNorm(self.head_dim, eps=cfg['rms_norm_eps'])
 
+    # ---------------------------------------------------------------------
+    # QwenAttention.forward (drop-in replacement)
     def forward(self, x, rope: RotaryEmbedding):
+        """
+        x  : [B, T, D]
+        out: [B, T, D]
+        """
         B, T, _ = x.shape
-        q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim)
-        k = self.k_proj(x).view(B, T, self.n_kv,   self.head_dim)
-        v = self.v_proj(x).view(B, T, self.n_kv,   self.head_dim)
+        Hd = self.head_dim
+        H  = self.n_heads          # 32
+        K  = self.n_kv             # 4
 
+        # 1) Projections --------------------------------------------------
+        q = self.q_proj(x).view(B, T, H, Hd)          # [B,T,H,Hd]
+        k = self.k_proj(x).view(B, T, K, Hd)          # [B,T,K,Hd]
+        v = self.v_proj(x).view(B, T, K, Hd)          # [B,T,K,Hd]
+
+        # 2) RoPE ---------------------------------------------------------
         pos = torch.arange(T, device=x.device)
         q = self.q_norm(q)
         k = self.k_norm(k)
-
         q = get_rope((rope.sin, rope.cos), pos, q)
         k = get_rope((rope.sin, rope.cos), pos, k)
 
-        att = (q.float() @ k.float().transpose(-1, -2)) / math.sqrt(self.head_dim)
-        att = att.softmax(-1)                  # stay in FP32
-        out = (att @ v.float()).to(q.dtype)    # cast only the result
-        return self.o_proj(out.view(B, T, -1))
+        # 3) Head layout: (B,H,T,Hd) vs (B,H,T,Hd)
+        q = q.permute(0, 2, 1, 3)                     # [B,H,T,Hd]
+        # broadcast K/V heads to all Q heads
+        k = k.permute(0, 2, 1, 3)                     # [B,K,T,Hd]
+        v = v.permute(0, 2, 1, 3)                     # [B,K,T,Hd]
+        if K == 1 or K == H:
+            k = k
+            v = v
+        else:
+            # repeat K/V to match 32 heads (32 // 4 == 8 times)
+            repeat = H // K
+            k = k.repeat_interleave(repeat, dim=1)    # [B,H,T,Hd]
+            v = v.repeat_interleave(repeat, dim=1)
+
+        # 4) Scaled dot-product ------------------------------------------
+        att = (q.float() @ k.float().transpose(-1, -2)) / math.sqrt(Hd)  # [B,H,T,T]
+
+        # causal mask: keep lower-triangular, set upper to -inf
+        causal_mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=x.device), 1)
+        att = att.masked_fill(causal_mask, float('-inf'))
+
+        att = att.softmax(-1)                         # still FP32
+        out = (att @ v.float()).to(q.dtype)           # [B,H,T,Hd]  -> BF16
+
+        # 5) Merge heads --------------------------------------------------
+        out = out.permute(0, 2, 1, 3).contiguous().view(B, T, H*Hd)  # [B,T,D]
+        return self.o_proj(out)
+
 
 # Decoder layer --------------------------------------------------------------
 class DecoderLayer(torch.nn.Module):
@@ -220,15 +255,18 @@ def load_weights(model, model_dir):
 
 # ---------------- token sampling -------------------------------------------
 @torch.no_grad()
-def generate(model, input_ids, max_new=128, temperature=0.8,
+def generate(model, input_ids, max_new=16, temperature=0.7,
              top_p=0.95, top_k=50, eos=None):
-    model.eval()
     for _ in range(max_new):
-        logits = model(input_ids)[:, -1, :] / temperature
-        top_k = min(top_k, logits.size(-1))
-        topk_vals, topk_idx = torch.topk(logits, top_k, dim=-1)
-        probs = torch.softmax(topk_vals, -1)
-        next_token = topk_idx.gather(-1, torch.multinomial(probs, 1))
+        logits = model(input_ids)[:, -1, :]
+        if temperature == 0:                       # greedy
+            next_token = logits.argmax(-1, keepdim=True)
+        else:
+            logits = logits / temperature
+            top_k = min(top_k, logits.size(-1))
+            topk_vals, topk_idx = torch.topk(logits, top_k, dim=-1)
+            probs = torch.softmax(topk_vals, -1)
+            next_token = topk_idx.gather(-1, torch.multinomial(probs, 1))
         input_ids = torch.cat([input_ids, next_token], dim=-1)
         if eos is not None and next_token.item() == eos:
             break
